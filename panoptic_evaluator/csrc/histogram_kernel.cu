@@ -98,7 +98,7 @@ __global__ void pack(const Map* maps, const int64_t* ids, const int* slots,
 
 // Area checks share the exact reductions needed by scoring. No extra pixel pass.
 __device__ void prepare_image(const Count* pairs, const int* gc, const int* pc,
-    const bool* crowd, Count* areas, int* matched, int G, int P, int C, int* error) {
+    const bool* crowd, Count* areas, int* matched, int G, int P, int C, int* error, bool reward = false) {
   int lane = threadIdx.x & 31;
   int warp = threadIdx.x / 32;
   // Small rows retain the cheaper thread-per-row reduction.
@@ -126,17 +126,17 @@ __device__ void prepare_image(const Count* pairs, const int* gc, const int* pc,
     areas[G + p] = sum;
     if (error) {
       if (pc[p] < -1 || pc[p] >= C || (p == 0 && pc[p] != -1)) atomicOr(error, 2);
-      if (p > 0 && ((sum > 0) != (pc[p] >= 0))) atomicOr(error, 4);
+      if (p > 0 && (reward ? (sum > 0 && pc[p] < 0) : ((sum > 0) != (pc[p] >= 0)))) atomicOr(error, 4);
     }
   }
   __syncthreads();
 }
 
 __global__ void prepare(const Count* pairs, const int* gc, const int* pc,
-    const bool* crowd, Count* areas, int* matched, int G, int P, int C, int* error) {
+    const bool* crowd, Count* areas, int* matched, int G, int P, int C, int* error, bool reward = false) {
   int64_t b = blockIdx.x;
   prepare_image(pairs + b * G * P, gc + b * G, pc + b * P, crowd + b * G,
-                areas + b * (G + P), matched + b * G, G, P, C, error);
+                areas + b * (G + P), matched + b * G, G, P, C, error, reward);
 }
 
 // One block owns an image, so barriers safely connect areas, matches and FN.
@@ -144,7 +144,7 @@ __global__ void prepare(const Count* pairs, const int* gc, const int* pc,
 template <bool Multi = false>
 __global__ void accumulate(const Count* pairs, const int* gc, const int* pc,
     const bool* crowd, Count* areas, int* matched, Count* tp, Count* fp,
-    Count* fn, double* iou_sum, Count* confusion, int G, int P, int C, bool areas_ready) {
+    Count* fn, double* iou_sum, Count* confusion, int G, int P, int C, bool areas_ready, bool reward = false) {
   int chunks = (P + blockDim.x - 1) / blockDim.x;
   int b = Multi ? blockIdx.x / chunks : blockIdx.x, t = threadIdx.x;
   pairs += static_cast<int64_t>(b) * G * P;
@@ -153,6 +153,10 @@ __global__ void accumulate(const Count* pairs, const int* gc, const int* pc,
   crowd += static_cast<int64_t>(b) * G;
   areas += static_cast<int64_t>(b) * (G + P);
   matched += static_cast<int64_t>(b) * G;
+  if (reward) {
+    tp += static_cast<int64_t>(b) * C; fp += static_cast<int64_t>(b) * C;
+    fn += static_cast<int64_t>(b) * C; iou_sum += static_cast<int64_t>(b) * C;
+  }
   if (!areas_ready) prepare_image(pairs, gc, pc, crowd, areas, matched, G, P, C, nullptr);
   for (int p = Multi ? (blockIdx.x % chunks) * blockDim.x + t : t;
        p < P; p += Multi ? P : blockDim.x) {
@@ -165,7 +169,7 @@ __global__ void accumulate(const Count* pairs, const int* gc, const int* pc,
       int target = gc[g];
       Count intersection = pairs[static_cast<int64_t>(g) * P + p];
       bool valid_target = target >= 0 && target < C;
-      if (valid_target && !crowd[g] && intersection) {
+      if (!reward && valid_target && !crowd[g] && intersection) {
         int label = valid_prediction ? prediction : C;
         atomicAdd(confusion + static_cast<int64_t>(target) * (C + 1) + label, intersection);
       }
@@ -184,7 +188,7 @@ __global__ void accumulate(const Count* pairs, const int* gc, const int* pc,
         }
       }
     }
-    if (valid_prediction) {
+    if (valid_prediction && (!reward || areas[G + p] > 0)) {
       if (pm) {
         atomicAdd(tp + prediction, 1ULL);
         atomicAdd(iou_sum + prediction, sum_iou);
@@ -256,7 +260,7 @@ int update_cuda(torch::Tensor gt, torch::Tensor pred, torch::Tensor gc,
     torch::Tensor fp, torch::Tensor fn, torch::Tensor iou_sum,
     torch::Tensor confusion, c10::optional<torch::Tensor> gt_ids,
     c10::optional<torch::Tensor> gt_slots, c10::optional<torch::Tensor> pred_ids,
-    c10::optional<torch::Tensor> pred_slots, torch::Tensor error, bool validate) {
+    c10::optional<torch::Tensor> pred_slots, torch::Tensor error, bool validate, bool reward) {
   TORCH_CHECK(gt.is_cuda() && gt.dim() == 3, "gt must be CUDA B x H x W");
   c10::cuda::CUDAGuard guard(gt.device());
   for (const auto& t : {gt, pred}) {
@@ -271,15 +275,15 @@ int update_cuda(torch::Tensor gt, torch::Tensor pred, torch::Tensor gc,
   TORCH_CHECK(pred.sizes() == gt.sizes() && gc.dim() == 2 && pc.dim() == 2 &&
               gc.size(0) == gt.size(0) && pc.size(0) == gt.size(0) &&
               crowd.sizes() == gc.sizes(), "incorrect input shapes");
-  int64_t B = gt.size(0), G = gc.size(1), P = pc.size(1), C = tp.numel();
+  int64_t B = gt.size(0), G = gc.size(1), P = pc.size(1), C = reward ? tp.size(1) : tp.numel();
   TORCH_CHECK(C > 0 && C < INT_MAX && G > 0 && G < INT_MAX && P > 0 && P < INT_MAX,
               "invalid capacities");
   TORCH_CHECK(pairs.dim() == 3 && pairs.size(0) == B && pairs.size(1) == G && pairs.size(2) == P &&
               areas.dim() == 2 && areas.size(0) == B && areas.size(1) == G + P &&
               matched.sizes() == gc.sizes() && error.numel() == 1, "incorrect scratch shapes");
-  TORCH_CHECK(tp.dim() == 1 && fp.sizes() == tp.sizes() && fn.sizes() == tp.sizes() &&
-              iou_sum.sizes() == tp.sizes() && confusion.dim() == 2 &&
-              confusion.size(0) == C && confusion.size(1) == C + 1, "incorrect state shapes");
+  TORCH_CHECK((reward ? (tp.dim() == 2 && tp.size(0) == B) : tp.dim() == 1) && fp.sizes() == tp.sizes() && fn.sizes() == tp.sizes() &&
+              iou_sum.sizes() == tp.sizes() && (reward || (confusion.dim() == 2 &&
+              confusion.size(0) == C && confusion.size(1) == C + 1)), "incorrect state shapes");
   const int64_t* gi = lookup_ids(gt_ids, gt_slots, gc, gt);
   const int64_t* pi = lookup_ids(pred_ids, pred_slots, pc, gt);
   const int* gs = gt_slots ? gt_slots->data_ptr<int>() : nullptr;
@@ -303,11 +307,11 @@ int update_cuda(torch::Tensor gt, torch::Tensor pred, torch::Tensor gc,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   const char* scoring = std::getenv("PANOPTIC_SCORING");
-  bool multi = scoring && std::string(scoring) == "multi";
+  bool multi = !reward && scoring && std::string(scoring) == "multi";
   if (validate || multi) {
     if (B) {
       prepare<<<B, 256, 0, stream>>>(pair_data, gc.data_ptr<int>(), pc.data_ptr<int>(), crowd.data_ptr<bool>(),
-          area_data, matched.data_ptr<int>(), G, P, C, validate ? error.data_ptr<int>() : nullptr);
+          area_data, matched.data_ptr<int>(), G, P, C, validate ? error.data_ptr<int>() : nullptr, reward);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     // Exactly one scalar transfer/synchronization; errors cannot mutate totals.
@@ -329,7 +333,7 @@ int update_cuda(torch::Tensor gt, torch::Tensor pred, torch::Tensor gc,
     accumulate<false><<<B, 256, 0, stream>>>(pair_data, gc.data_ptr<int>(), pc.data_ptr<int>(), crowd.data_ptr<bool>(),
         area_data, matched.data_ptr<int>(), reinterpret_cast<Count*>(tp.data_ptr<int64_t>()),
         reinterpret_cast<Count*>(fp.data_ptr<int64_t>()), reinterpret_cast<Count*>(fn.data_ptr<int64_t>()),
-        iou_sum.data_ptr<double>(), reinterpret_cast<Count*>(confusion.data_ptr<int64_t>()), G, P, C, validate);
+        iou_sum.data_ptr<double>(), reinterpret_cast<Count*>(confusion.data_ptr<int64_t>()), G, P, C, validate, reward);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }

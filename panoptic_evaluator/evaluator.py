@@ -105,7 +105,7 @@ class PanopticBatch:
         return PanopticBatch(packed, self.classes, self.crowd)
 
 
-def _prepare(batch: PanopticBatch, num_classes: int, validate: bool, *, ignore_crowd: bool = False):
+def _prepare(batch: PanopticBatch, num_classes: int, validate: bool, *, ignore_crowd: bool = False, allow_empty_slots: bool = False):
     maps, classes = batch.segment_map, batch.classes
     if maps.ndim != 3 or classes.ndim != 2 or classes.shape[0] != maps.shape[0] or classes.shape[1] < 1:
         raise ValueError("expected maps B x H x W and classes B x S with S >= 1")
@@ -131,17 +131,21 @@ def _prepare(batch: PanopticBatch, num_classes: int, validate: bool, *, ignore_c
             raise ValueError("classes must be -1 or valid category indices; slot 0 must be void")
         areas = torch.zeros_like(classes, dtype=torch.int64)
         areas.scatter_add_(1, maps.flatten(1).long(), torch.ones_like(maps.flatten(1), dtype=torch.int64))
-        if bool(((areas[:, 1:] > 0) != (classes[:, 1:] >= 0)).any()):
+        invalid = ((areas[:, 1:] > 0) & (classes[:, 1:] < 0) if allow_empty_slots
+                   else (areas[:, 1:] > 0) != (classes[:, 1:] >= 0))
+        if bool(invalid.any()):
             raise ValueError("nonvoid map slots and active metadata must correspond exactly")
     return maps.contiguous(), classes.contiguous(), crowd.contiguous() if crowd is not None else None
 
 
-def _histogram(gt, pred, gc, pc, crowd, C):
+def _histogram(gt, pred, gc, pc, crowd, C, *, pq_only=False):
     B, H, W = gt.shape
     G, P = gc.shape[1], pc.shape[1]
     offsets = torch.arange(B, device=gt.device)[:, None, None] * G * P
     pairs = torch.bincount((offsets + gt.long() * P + pred.long()).flatten(),
                            minlength=B * G * P).reshape(B, G, P)
+    if pq_only:
+        return pairs
     target = gc.gather(1, gt.flatten(1).long())
     prediction = pc.gather(1, pred.flatten(1).long())
     valid = (target >= 0) & ~crowd.gather(1, gt.flatten(1).long())
@@ -279,3 +283,74 @@ class PanopticEvaluator:
                 "miou": torch.nan_to_num(semantic_iou).sum() / (union > 0).sum().clamp_min(1),
                 "tp": self.tp.clone(), "fp": self.fp.clone(), "fn": self.fn.clone(),
                 "iou_sum": self.iou_sum.clone(), "confusion": self.confusion.clone()}
+
+
+@torch.no_grad()
+def panoptic_quality(prediction: PanopticBatch, target: PanopticBatch,
+                     num_classes: int, reduction: str = "none", *, validate: bool = True) -> torch.Tensor:
+    """Stateless mean-class PQ per image (float64 on the input device).
+
+    Prepared target and prediction metadata may be reused with ``with_maps``.
+    Prediction slots without pixels are ignored, including fully occluded slots.
+    Set validate=False for trusted inputs to avoid CUDA value-check synchronization.
+    Only reduction="none" is supported; no dataset or semantic metrics are computed.
+    """
+    if not isinstance(num_classes, int) or num_classes <= 0:
+        raise ValueError("num_classes must be a positive integer")
+    if reduction != "none":
+        raise ValueError('reduction must be "none"')
+    if not target.segment_map.is_cuda:
+        target, prediction = target.compact(), prediction.compact()
+    host_validate = validate and not target.segment_map.is_cuda
+    gt, gc, crowd = _prepare(target, num_classes, host_validate)
+    pred, pc, _ = _prepare(prediction, num_classes, host_validate,
+                           ignore_crowd=True, allow_empty_slots=True)
+    if gt.shape != pred.shape or gt.device != pred.device:
+        raise ValueError("prediction and target must share shape and device")
+    B, G, P = gt.shape[0], gc.shape[1], pc.shape[1]
+    tp = torch.zeros((B, num_classes), dtype=torch.int64, device=gt.device)
+    fp, fn = torch.zeros_like(tp), torch.zeros_like(tp)
+    sums = torch.zeros_like(tp, dtype=torch.float64)
+    if gt.is_cuda:
+        if _cuda_evaluator is None:
+            raise RuntimeError("CUDA extension unavailable; run python setup.py build_ext --inplace")
+        error = _cuda_evaluator.update(
+            gt, pred, gc, pc, crowd,
+            torch.empty((B, G, P), dtype=torch.int64, device=gt.device),
+            torch.empty((B, G + P), dtype=torch.int64, device=gt.device),
+            torch.empty((B, G), dtype=torch.int32, device=gt.device),
+            tp, fp, fn, sums, torch.empty(0, dtype=torch.int64, device=gt.device),
+            target.lookup_ids.contiguous() if target.lookup_ids is not None else None,
+            target.lookup_slots.contiguous() if target.lookup_slots is not None else None,
+            prediction.lookup_ids.contiguous() if prediction.lookup_ids is not None else None,
+            prediction.lookup_slots.contiguous() if prediction.lookup_slots is not None else None,
+            torch.empty(1, dtype=torch.int32, device=gt.device), validate, True)
+        if error:
+            if error & 1:
+                raise ValueError("map contains an unknown segment ID or a slot outside metadata capacity")
+            if error & 2:
+                raise ValueError("classes must be -1 or valid category indices; slot 0 must be void")
+            raise ValueError("nonvoid map slots and active metadata must correspond exactly")
+    else:
+        pairs = _histogram(gt, pred, gc, pc, crowd, num_classes, pq_only=True)
+        ga, pa = pairs.sum(2), pairs.sum(1)
+        union = ga[:, :, None] + pa[:, None, :] - pairs - pairs[:, :1, :]
+        iou = pairs.double() / union.clamp_min(1)
+        matches = (gc[:, :, None] == pc[:, None, :]) & (gc[:, :, None] >= 0) & ~crowd[:, :, None] & (iou > 0.5)
+        gm, pm = matches.any(2), matches.any(1)
+        # Official API keeps the last crowd segment per category in metadata order.
+        slots = torch.arange(gc.shape[1], device=gt.device)[None, :, None]
+        same_crowd = crowd[:, :, None] & (gc[:, :, None] == pc[:, None, :]) & (gc[:, :, None] >= 0)
+        last = torch.where(same_crowd, slots, -1).amax(1)
+        overlap = pairs.gather(1, last.clamp_min(0)[:, None, :]).squeeze(1)
+        ignored_area = pairs[:, 0, :] + torch.where(last >= 0, overlap, 0)
+        false_positive = (pc >= 0) & (pa > 0) & ~pm & (ignored_area.double() <= 0.5 * pa)
+        false_negative = (gc >= 0) & ~crowd & ~gm
+        for labels, mask, output in ((pc, pm, tp), (pc, false_positive, fp),
+                                     (gc, false_negative, fn)):
+            output.scatter_add_(1, labels.clamp_min(0).long(), mask.long())
+        sums.scatter_add_(1, pc.clamp_min(0).long(), (iou * matches).sum(1))
+    denominator = tp.double() + 0.5 * (fp + fn).double()
+    active = denominator > 0
+    pq = sums / denominator.clamp_min(1)
+    return pq.sum(1) / active.sum(1).clamp_min(1)
