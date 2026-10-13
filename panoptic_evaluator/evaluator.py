@@ -466,12 +466,15 @@ class PanopticEvaluator:
 
 @torch.no_grad()
 def panoptic_quality(prediction: PanopticBatch, target: PanopticBatch,
-                     num_classes: int, reduction: str = "none", *, validate: bool = True) -> torch.Tensor:
+                     num_classes: int, reduction: str = "none", *, validate: bool = True,
+                     return_stats: bool = False) -> torch.Tensor:
     """Stateless mean-class PQ per image (float64 on the input device).
 
     Prepared target and prediction metadata may be reused with ``with_maps``.
     Prediction slots without pixels are ignored, including fully occluded slots.
     Set validate=False for trusted inputs to avoid CUDA value-check synchronization.
+    With return_stats=True, return [image, class, (IoU sum, TP, FP, FN)]
+    sufficient statistics instead of scores.
     Only reduction="none" is supported; no dataset or semantic metrics are computed.
     """
     if not isinstance(num_classes, int) or num_classes <= 0:
@@ -529,6 +532,8 @@ def panoptic_quality(prediction: PanopticBatch, target: PanopticBatch,
                                      (gc, false_negative, fn)):
             output.scatter_add_(1, labels.clamp_min(0).long(), mask.long())
         sums.scatter_add_(1, pc.clamp_min(0).long(), (iou * matches).sum(1))
+    if return_stats:
+        return torch.stack((sums, tp.double(), fp.double(), fn.double()), -1)
     denominator = tp.double() + 0.5 * (fp + fn).double()
     active = denominator > 0
     pq = sums / denominator.clamp_min(1)
