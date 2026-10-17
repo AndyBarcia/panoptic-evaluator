@@ -16,6 +16,7 @@ setup(
                 "panoptic_evaluator/csrc/histogram_kernel.cu",
                 "panoptic_evaluator/csrc/compute_kernel.cu",
                 "panoptic_evaluator/csrc/instance_kernel.cu",
+                "panoptic_evaluator/csrc/prefix_kernel.cu",
             ],
             extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3"]},
         )

@@ -1,0 +1,110 @@
+{
+  "metadata": {
+    "torch": "2.7.0+cu126",
+    "threads": 1,
+    "gpu": null,
+    "rounds": 3,
+    "stride": 1
+  },
+  "results": [
+    {
+      "device": "cpu",
+      "height": 128,
+      "width": 192,
+      "predictions": 16,
+      "checkpoints": 16,
+      "validate": false,
+      "parity": true,
+      "median_ms": {
+        "prefix": 16.893398948013783,
+        "standard_pr": 151.17785427719355,
+        "standard_ap": 203.76857463270426
+      },
+      "peak_extra_mib": {},
+      "samples_ms": {
+        "prefix": [
+          17.057199962437153,
+          16.893398948013783,
+          16.54065679758787
+        ],
+        "standard_pr": [
+          158.37368182837963,
+          146.7901263386011,
+          151.17785427719355
+        ],
+        "standard_ap": [
+          205.0794716924429,
+          196.6182878240943,
+          203.76857463270426
+        ]
+      },
+      "speedup_vs_standard_pr": 8.948930570006343
+    },
+    {
+      "device": "cpu",
+      "height": 256,
+      "width": 384,
+      "predictions": 64,
+      "checkpoints": 64,
+      "validate": false,
+      "parity": true,
+      "median_ms": {
+        "prefix": 97.50868938863277,
+        "standard_pr": 4674.027752131224,
+        "standard_ap": 4905.263613909483
+      },
+      "peak_extra_mib": {},
+      "samples_ms": {
+        "prefix": [
+          95.93134932219982,
+          97.50868938863277,
+          103.19653525948524
+        ],
+        "standard_pr": [
+          4664.016897790134,
+          4674.027752131224,
+          4761.493776924908
+        ],
+        "standard_ap": [
+          4904.143995605409,
+          4905.263613909483,
+          4916.5840754285455
+        ]
+      },
+      "speedup_vs_standard_pr": 47.93447416262889
+    },
+    {
+      "device": "cpu",
+      "height": 512,
+      "width": 768,
+      "predictions": 64,
+      "checkpoints": 64,
+      "validate": false,
+      "parity": true,
+      "median_ms": {
+        "prefix": 168.2346649467945,
+        "standard_pr": 5522.942232899368,
+        "standard_ap": 5712.999088689685
+      },
+      "peak_extra_mib": {},
+      "samples_ms": {
+        "prefix": [
+          173.72868955135345,
+          168.2346649467945,
+          167.79641155153513
+        ],
+        "standard_pr": [
+          5522.942232899368,
+          5524.462423287332,
+          5506.870831362903
+        ],
+        "standard_ap": [
+          5712.999088689685,
+          5711.409938521683,
+          5731.292278505862
+        ]
+      },
+      "speedup_vs_standard_pr": 32.8288003821688
+    }
+  ]
+}

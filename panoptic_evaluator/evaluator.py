@@ -376,6 +376,10 @@ class PanopticEvaluator:
                 )
             return self._scratch[1][:, : gc.shape[1]] if return_areas else self
         pairs, semantic = _histogram(gt, pred, gc, pc, crowd, self.num_classes)
+        return self._update_histogram(pairs, semantic, gc, pc, crowd, return_areas=return_areas)
+
+    def _update_histogram(self, pairs, semantic, gc, pc, crowd, *, return_areas=False):
+        """Accumulate sufficient statistics from compact segment intersections."""
         ga, pa = pairs.sum(2), pairs.sum(1)
         union = ga[:, :, None] + pa[:, None, :] - pairs - pairs[:, :1, :]
         iou = pairs.double() / union.clamp_min(1)
@@ -387,7 +391,7 @@ class PanopticEvaluator:
         )
         gm, pm = matches.any(2), matches.any(1)
         # Official API keeps the last crowd segment per category in metadata order.
-        slots = torch.arange(gc.shape[1], device=gt.device)[None, :, None]
+        slots = torch.arange(gc.shape[1], device=pairs.device)[None, :, None]
         same_crowd = (
             crowd[:, :, None]
             & (gc[:, :, None] == pc[:, None, :])

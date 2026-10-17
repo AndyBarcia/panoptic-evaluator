@@ -21,6 +21,10 @@ std::vector<torch::Tensor> instance_match_histogram_cuda(torch::Tensor pairs,
     torch::Tensor pc, torch::Tensor gc, torch::Tensor pa, torch::Tensor ga,
     torch::Tensor crowd, torch::Tensor areas, int64_t C);
 
+std::vector<torch::Tensor> prefix_cuda(torch::Tensor gt, torch::Tensor masks,
+    torch::Tensor pc, torch::Tensor gc, torch::Tensor crowd, torch::Tensor things,
+    torch::Tensor thresholds, std::vector<int64_t> points, bool validate);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("update", &update_cuda, "Count intersections, validate and accumulate metrics",
     pybind11::arg("gt"),
@@ -43,6 +47,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     pybind11::arg("error"),
     pybind11::arg("validate"),
     pybind11::arg("reward") = false);
+  m.def("prefix", &prefix_cuda, "Fused incremental generation-prefix evaluation");
   m.def("compute", &compute_cuda, "Compute metric summaries and independent snapshots");
   m.def("pack", &pack_cuda, "Materialize compact slots with one pixel kernel");
   m.def("instance_update", &instance_update_cuda, "Mask IoU and COCO greedy matching");

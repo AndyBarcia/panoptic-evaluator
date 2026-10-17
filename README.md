@@ -79,7 +79,7 @@ list of tensors for each field, with one tensor per image:
 | --- | --- | --- |
 | `masks` | `N × H × W`, bool | Individual masks; overlaps are allowed. |
 | `classes` | `N`, int32/int64 | Category per instance. |
-| `scores` | `N`, float | Required prediction confidence scores. |
+| `scores` | `N`, float | Required for AP/AR predictions; unused for generation prefixes. |
 | `crowd` | Optional `N`, bool | Ground-truth crowd flags. |
 | `areas` | Optional `N`, float | Ground-truth annotation areas for AP filtering. |
 
@@ -174,50 +174,53 @@ Results include `ap`, `ap50`, `ap75`, `ap_small`, `ap_medium`, `ap_large`, `ar1`
 (`10 × 101 × C × 4 × 3`) and `recall` (`10 × C × 4 × 3`) arrays are also
 returned. Unavailable settings have a value of -1.
 
-## Build and test
+### Generation prefixes
 
-CPU evaluation requires PyTorch. For CUDA, build with a matching CUDA toolkit.
-From this directory, use the provided container:
+`segmentation_prefixes(prediction, target, num_classes, *, isthing=None,
+checkpoints=None, iou_thresholds=(0.5, 0.75), validate=True)` accepts an
+`InstanceBatch` in generation order and a `PanopticBatch` target. Scores are
+ignored. It returns one list per image, containing that image's metrics at each
+requested prefix:
 
-```bash
-apptainer exec --nv \
-  --bind "$PWD:/workspace/panoptic-evaluator" \
-  --pwd /workspace/panoptic-evaluator \
-  /data/Andy/fcclip-torch27-cu126.sif \
-  python setup.py build_ext --inplace
+```python
+from panoptic_evaluator import InstanceBatch, segmentation_prefixes
 
-apptainer exec --nv \
-  --bind "$PWD:/workspace/panoptic-evaluator" \
-  --pwd /workspace/panoptic-evaluator \
-  /data/Andy/fcclip-torch27-cu126.sif \
-  python -m unittest discover -s tests -v
+# Masks and classes are in generation order; scores are unnecessary.
+sequence = InstanceBatch(masks, classes)
+curves = segmentation_prefixes(
+    sequence, target, num_classes=15, isthing=isthing,
+    iou_thresholds=(0.5, 0.75),
+    # checkpoints=[0, 1, 5, 10],  # Optional; otherwise evaluate every prefix.
+)
+for step in curves[0]:  # First image.
+    print(step["prefix"], step["All"]["pq"], step["miou"],
+          step["instance"]["precision"], step["instance"]["recall"])
 ```
 
-Tests require NumPy and Pillow. Install `pycocotools` and
-[`panopticapi`](https://github.com/cocodataset/panopticapi) for optional reference
-comparisons; evaluation itself does not require them.
+Each image returns its own list of snapshots, allowing different sequence
+lengths. Later masks overwrite earlier masks on the panoptic/semantic canvas;
+each mask creates a distinct panoptic segment, including stuff masks. Fully
+occluded segments disappear from canvas metrics. Instance metrics use the
+original masks of thing classes, even after occlusion, and ignore stuff masks.
 
-## Benchmarks
+Instance matching proceeds in generation order independently at each IoU
+threshold, using same-class GT with IoU **at least** the threshold. The best
+available noncrowd match is preferred, followed by an ignored crowd match;
+crowd targets are reusable and use intersection/detection-area IoU. Ties use
+GT slot order. There is no confidence sorting or detection cap. This defines
+generation-order precision/recall, rather than COCO AP/AR. It is greedy, not
+maximum-cardinality matching: an early mask's match remains fixed at later
+prefixes. Duplicate unmatched predictions count as false positives.
 
-Run these commands inside the same container:
+`instance` contains `iou_thresholds`, plus `tp`, `fp`, `fn`, `precision`, and
+`recall` arrays of shape `thresholds × classes`. Zero denominators return zero.
+All outputs are tensors on the target device, except the integer `prefix`.
+Snapshots remain valid after processing later steps. Empty sequences return the
+prefix-zero snapshot. Explicit checkpoints must be strictly increasing and valid
+for every image; an empty checkpoint list returns no snapshots.
 
-```bash
-python -m examples.benchmark --batch-size 8 --segments 64
-python -m examples.benchmark_instance
-python -m examples.benchmark_combined
-```
-
-The instance comparison requires pycocotools. Add `--validate` to include input
-validation. The combined comparison checks results against separate evaluators.
-
-Recorded combined evaluation times on an A100 80GB PCIe, with eight images,
-15 categories, and validation disabled:
-
-| Image size | GT segments / detections per image | Combined ms/batch | Separate ms/batch |
-| --- | ---: | ---: | ---: |
-| 256 × 384 | 64 / 64 | 3.776 | 3.964 |
-| 512 × 768 | 256 / 256 | 5.350 | 28.344 |
-
-Times are medians over seven rounds of reset, update, and compute. Input
-preparation is excluded. These synthetic measurements depend on workload and
-hardware.
+Panoptic and semantic results have the same fields as `PanopticEvaluator`.
+These are per-image results: for dataset curves, sum counts, IoU sums, and
+confusion matrices at each prefix before computing metrics; do not average
+per-image ratios. Sum instance counts at each prefix before computing dataset
+precision/recall as well.

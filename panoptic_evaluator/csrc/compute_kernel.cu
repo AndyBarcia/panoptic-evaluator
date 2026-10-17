@@ -11,6 +11,12 @@ __global__ void compute(const int64_t* tp, const int64_t* fp, const int64_t* fn,
     double* per_class, double* summaries, int64_t* counts, double* miou,
     int64_t* out_tp, int64_t* out_fp, int64_t* out_fn, double* out_sums,
     int64_t* out_confusion, int C) {
+  int64_t b = blockIdx.x;
+  tp += b*C; fp += b*C; fn += b*C; sums += b*C;
+  confusion += b*C*(C+1); per_class += b*4*C;
+  summaries += b*9; counts += b*3; miou += b;
+  out_tp += b*C; out_fp += b*C; out_fn += b*C; out_sums += b*C;
+  out_confusion += b*C*(C+1);
   __shared__ double reduction[14][256];
   int t = threadIdx.x;
   double local[14] = {};
@@ -86,4 +92,27 @@ std::vector<torch::Tensor> compute_cuda(torch::Tensor tp, torch::Tensor fp,
       out_sums.data_ptr<double>(), out_confusion.data_ptr<int64_t>(), C);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {per_class, summaries, counts, miou, out_tp, out_fp, out_fn, out_sums, out_confusion};
+}
+
+// Prefix sufficient statistics are independent rows; summarize them in one launch.
+std::vector<torch::Tensor> compute_prefix_cuda(torch::Tensor tp, torch::Tensor fp,
+    torch::Tensor fn, torch::Tensor sums, torch::Tensor confusion, torch::Tensor things) {
+  int64_t K = tp.size(0), C = tp.size(1);
+  auto doubles = sums.options();
+  auto values = torch::empty({K, 4, C}, doubles);
+  auto summaries = torch::empty({K, 3, 3}, doubles);
+  auto counts = torch::empty({K, 3}, tp.options());
+  auto miou = torch::empty({K}, doubles);
+  auto ot = torch::empty_like(tp), of = torch::empty_like(fp), on = torch::empty_like(fn);
+  auto os = torch::empty_like(sums), oc = torch::empty_like(confusion);
+  if (K) {
+    compute<<<K, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      tp.data_ptr<int64_t>(), fp.data_ptr<int64_t>(), fn.data_ptr<int64_t>(), sums.data_ptr<double>(),
+      confusion.data_ptr<int64_t>(), things.data_ptr<bool>(), values.data_ptr<double>(),
+      summaries.data_ptr<double>(), counts.data_ptr<int64_t>(), miou.data_ptr<double>(),
+      ot.data_ptr<int64_t>(), of.data_ptr<int64_t>(), on.data_ptr<int64_t>(), os.data_ptr<double>(),
+      oc.data_ptr<int64_t>(), C);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return {values, summaries, counts, miou, ot, of, on, os, oc};
 }
